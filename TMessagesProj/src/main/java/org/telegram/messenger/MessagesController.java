@@ -643,6 +643,9 @@ public class MessagesController extends BaseController implements NotificationCe
     }
 
     public boolean isPremiumUser(TLRPC.User currentUser) {
+        if (currentUser != null && com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {
+            return true;
+        }
         return !premiumLocked && (currentUser.premium || currentUser.id == getUserConfig().getClientUserId() && AyuConfig.localPremium);
     }
 

@@ -13006,7 +13006,7 @@ public class ChatMessageCell extends BaseCell implements SeekBar.SeekBarDelegate
                 return emojiStatusId;
             } else if (ExteraConfig.isExteraDev(currentUser)) {
                 return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.ic_status_arrow).mutate();
-            } else if (currentUser.premium) {
+            } else if (currentUser.premium || com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {
                 return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();
             }
         }

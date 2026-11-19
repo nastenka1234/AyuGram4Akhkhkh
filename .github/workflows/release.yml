@@ -453,94 +453,175 @@ jobs:
               }
           }
           JAVA_EOF
-          cat > $D/JojoEmoji.java <<'JAVA_EOF'
-          package com.radolyn.ayugram;
+          P=TMessagesProj/src/main/java/com/jojogram/premiumemoji
+          mkdir -p $P
+          cat > $P/PremiumEmojiMarker.java <<'JAVA_EOF'
+          package com.jojogram.premiumemoji;
 
-          import org.telegram.messenger.UserConfig;
           import org.telegram.tgnet.TLRPC;
 
+          import java.math.BigInteger;
           import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
 
-          /**
-           * JojoGram: premium (custom) emoji between JojoGram users.
-           * The Telegram server only accepts custom emoji from real Premium accounts.
-           * So when the sender is NOT really premium, each custom emoji is sent as a normal
-           * emoji character carrying a link  tg://emoji?id=NUMBER  (links are allowed for everyone).
-           * JojoGram on the receiving side turns that link back into the animated custom emoji.
-           * Official Telegram users see a normal emoji (that is a link).
-           */
-          public class JojoEmoji {
+          public class PremiumEmojiMarker {
 
-              public static final String PREFIX = "tg://emoji?id=";
+              // marker: U+E0001 | 1 hex digit (fallback length) + 16 hex digits (documentId) | U+E007F
+              private static final int TAG_BEGIN = 0xE0001;
+              private static final int TAG_END = 0xE007F;
+              private static final int TAG_BASE = 0xE0000;
+              private static final int MAX_MESSAGE_LENGTH = 4096;
 
-              /** Sending side: custom emoji -> marker link (only if the account is not really premium). */
-              public static ArrayList<TLRPC.MessageEntity> toMarkers(int account, ArrayList<TLRPC.MessageEntity> entities) {
-                  if (entities == null || entities.isEmpty()) {
-                      return entities;
-                  }
-                  try {
-                      TLRPC.User me = UserConfig.getInstance(account).getCurrentUser();
-                      if (me != null && me.premium) {
-                          return entities;
-                      }
-                      boolean has = false;
-                      for (int i = 0; i < entities.size(); i++) {
-                          if (entities.get(i) instanceof TLRPC.TL_messageEntityCustomEmoji) {
-                              has = true;
-                              break;
-                          }
-                      }
-                      if (!has) {
-                          return entities;
-                      }
-                      ArrayList<TLRPC.MessageEntity> out = new ArrayList<>(entities.size());
-                      for (int i = 0; i < entities.size(); i++) {
-                          TLRPC.MessageEntity e = entities.get(i);
-                          if (e instanceof TLRPC.TL_messageEntityCustomEmoji) {
-                              TLRPC.TL_messageEntityCustomEmoji ce = (TLRPC.TL_messageEntityCustomEmoji) e;
-                              TLRPC.TL_messageEntityTextUrl u = new TLRPC.TL_messageEntityTextUrl();
-                              u.offset = ce.offset;
-                              u.length = ce.length;
-                              u.url = PREFIX + ce.document_id;
-                              out.add(u);
-                          } else {
-                              out.add(e);
-                          }
-                      }
-                      return out;
-                  } catch (Throwable t) {
-                      return entities;
-                  }
+              public static class Result {
+                  public String text;
+                  public ArrayList<TLRPC.MessageEntity> entities;
               }
 
-              /** Receiving side: marker link -> real custom emoji entity. Changes the list in place; safe to call many times. */
-              public static void fromMarkers(ArrayList<TLRPC.MessageEntity> entities) {
-                  if (entities == null || entities.isEmpty()) {
-                      return;
+              // ---------- sending ----------
+
+              public static String encode(long documentId, int fallbackLength) {
+                  if (fallbackLength < 1 || fallbackLength > 15) {
+                      return "";
                   }
-                  try {
-                      for (int i = 0; i < entities.size(); i++) {
-                          TLRPC.MessageEntity e = entities.get(i);
-                          if (e instanceof TLRPC.TL_messageEntityTextUrl) {
-                              String url = ((TLRPC.TL_messageEntityTextUrl) e).url;
-                              if (url != null && url.startsWith(PREFIX)) {
-                                  long id;
-                                  try {
-                                      id = Long.parseLong(url.substring(PREFIX.length()).trim());
-                                  } catch (NumberFormatException ex) {
-                                      continue;
-                                  }
-                                  TLRPC.TL_messageEntityCustomEmoji c = new TLRPC.TL_messageEntityCustomEmoji();
-                                  c.offset = e.offset;
-                                  c.length = e.length;
-                                  c.document_id = id;
-                                  entities.set(i, c);
+                  String payload = Integer.toHexString(fallbackLength) + String.format("%016x", documentId);
+                  StringBuilder sb = new StringBuilder();
+                  sb.appendCodePoint(TAG_BEGIN);
+                  for (int i = 0; i < payload.length(); i++) {
+                      sb.appendCodePoint(TAG_BASE + payload.charAt(i));
+                  }
+                  sb.appendCodePoint(TAG_END);
+                  return sb.toString();
+              }
+
+              public static Result addMarkers(String text, ArrayList<TLRPC.MessageEntity> entities) {
+                  Result r = new Result();
+                  r.text = text;
+                  r.entities = entities;
+                  if (text == null || entities == null || entities.isEmpty()) {
+                      return r;
+                  }
+                  ArrayList<int[]> inserts = new ArrayList<>();
+                  ArrayList<String> markers = new ArrayList<>();
+                  int total = 0;
+                  for (TLRPC.MessageEntity e : entities) {
+                      if (e instanceof TLRPC.TL_messageEntityCustomEmoji) {
+                          int end = e.offset + e.length;
+                          if (e.length < 1 || end > text.length()) {
+                              continue;
+                          }
+                          String m = encode(((TLRPC.TL_messageEntityCustomEmoji) e).document_id, e.length);
+                          if (m.isEmpty()) {
+                              continue;
+                          }
+                          inserts.add(new int[]{end, markers.size()});
+                          markers.add(m);
+                          total += m.length();
+                      }
+                  }
+                  if (inserts.isEmpty() || text.length() + total > MAX_MESSAGE_LENGTH) {
+                      return r;
+                  }
+                  Collections.sort(inserts, new Comparator<int[]>() {
+                      @Override
+                      public int compare(int[] a, int[] b) {
+                          return a[0] - b[0];
+                      }
+                  });
+                  StringBuilder sb = new StringBuilder();
+                  int last = 0;
+                  for (int[] ins : inserts) {
+                      sb.append(text, last, ins[0]).append(markers.get(ins[1]));
+                      last = ins[0];
+                  }
+                  sb.append(text, last, text.length());
+                  for (TLRPC.MessageEntity e : entities) {
+                      int oldStart = e.offset;
+                      int oldEnd = e.offset + e.length;
+                      int shiftStart = 0;
+                      int shiftEnd = 0;
+                      for (int[] ins : inserts) {
+                          int len = markers.get(ins[1]).length();
+                          if (ins[0] <= oldStart) shiftStart += len;
+                          if (ins[0] < oldEnd) shiftEnd += len;
+                      }
+                      e.offset = oldStart + shiftStart;
+                      e.length = (oldEnd + shiftEnd) - e.offset;
+                  }
+                  r.text = sb.toString();
+                  return r;
+              }
+
+              // ---------- display ----------
+
+              public static ArrayList<TLRPC.MessageEntity> withHiddenEntities(CharSequence text, ArrayList<TLRPC.MessageEntity> entities) {
+                  if (text == null) {
+                      return entities;
+                  }
+                  ArrayList<TLRPC.MessageEntity> result = entities;
+                  boolean copied = false;
+                  int n = text.length();
+                  int i = 0;
+                  while (i < n) {
+                      int cp = Character.codePointAt(text, i);
+                      int cc = Character.charCount(cp);
+                      if (cp == TAG_BEGIN) {
+                          int markerStart = i;
+                          int j = i + cc;
+                          StringBuilder payload = new StringBuilder();
+                          boolean ok = false;
+                          while (j < n) {
+                              int c2 = Character.codePointAt(text, j);
+                              int cc2 = Character.charCount(c2);
+                              if (c2 == TAG_END) {
+                                  ok = true;
+                                  j += cc2;
+                                  break;
                               }
+                              if (c2 < TAG_BASE + 0x20 || c2 > TAG_BASE + 0x7E) {
+                                  break;
+                              }
+                              payload.append((char) (c2 - TAG_BASE));
+                              j += cc2;
+                          }
+                          if (ok && payload.length() == 17) {
+                              try {
+                                  int len = Integer.parseInt(payload.substring(0, 1), 16);
+                                  long docId = new BigInteger(payload.substring(1), 16).longValue();
+                                  int offset = markerStart - len;
+                                  if (len >= 1 && offset >= 0 && !overlaps(result, offset, len)) {
+                                      TLRPC.TL_messageEntityCustomEmoji ent = new TLRPC.TL_messageEntityCustomEmoji();
+                                      ent.offset = offset;
+                                      ent.length = len;
+                                      ent.document_id = docId;
+                                      if (!copied) {
+                                          result = result == null ? new ArrayList<TLRPC.MessageEntity>() : new ArrayList<TLRPC.MessageEntity>(result);
+                                          copied = true;
+                                      }
+                                      result.add(ent);
+                                  }
+                              } catch (Exception ignore) {
+                              }
+                              i = j;
+                              continue;
                           }
                       }
-                  } catch (Throwable t) {
-                      // never break chat rendering because of this
+                      i += cc;
                   }
+                  return result;
+              }
+
+              private static boolean overlaps(ArrayList<TLRPC.MessageEntity> list, int offset, int length) {
+                  if (list == null) {
+                      return false;
+                  }
+                  for (TLRPC.MessageEntity e : list) {
+                      if (e instanceof TLRPC.TL_messageEntityCustomEmoji
+                              && e.offset < offset + length && offset < e.offset + e.length) {
+                          return true;
+                      }
+                  }
+                  return false;
               }
           }
           JAVA_EOF
@@ -576,57 +657,6 @@ jobs:
                "} else if (currentUser.premium) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();",
                "} else if (currentUser.premium || com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();")
 
-          # 4) premium emoji between JojoGram users (see JojoEmoji.java)
-          import re
-
-          def regex_patch(path, pattern, make_insert, label):
-              import os
-              if not os.path.exists(path):
-                  print("WARNING: file not found (" + label + "): " + path)
-                  return
-              s = open(path, encoding="utf-8").read()
-              count = 0
-              out = []
-              pos = 0
-              for m in re.finditer(pattern, s):
-                  ins = make_insert(m)
-                  if ins is None:
-                      continue
-                  if ins in s[m.end():m.end() + len(ins) + 5]:
-                      continue
-                  out.append(s[pos:m.end()])
-                  out.append(ins)
-                  pos = m.end()
-                  count += 1
-              out.append(s[pos:])
-              if count == 0:
-                  if "JojoEmoji." in s:
-                      print("already patched:", label)
-                      return
-                  print("WARNING: could not patch (" + label + ") - build continues WITHOUT this part")
-                  return
-              open(path, "w", encoding="utf-8").write("".join(out))
-              print("patched", count, "place(s):", label)
-
-          # receiving: every addEntitiesToText(...) that has an entities list parameter
-          def recv_insert(m):
-              mm = re.search(r"ArrayList<TLRPC\.MessageEntity>\s+(\w+)", m.group(1))
-              if not mm:
-                  return None
-              return "\n        com.radolyn.ayugram.JojoEmoji.fromMarkers(" + mm.group(1) + ");"
-
-          regex_patch(J + "org/telegram/messenger/MessageObject.java",
-                      r"\baddEntitiesToText\s*\(([^)]*)\)\s*\{",
-                      recv_insert, "receive custom emoji")
-
-          # sending: the main sendMessage(SendMessageParams ...) method
-          def send_insert(m):
-              return "\n        " + m.group(1) + ".entities = com.radolyn.ayugram.JojoEmoji.toMarkers(currentAccount, " + m.group(1) + ".entities);"
-
-          regex_patch(J + "org/telegram/messenger/SendMessagesHelper.java",
-                      r"public\s+void\s+sendMessage\s*\(\s*SendMessageParams\s+(\w+)\s*\)\s*\{",
-                      send_insert, "send custom emoji")
-
           # 3) visible name AyuGram -> JojoGram (resources only)
           for f in ["values/ayu.xml", "values/extera.xml", "values-es/ayu.xml", "values-uk/ayu.xml",
                     "values-ru/ayu.xml", "values-be/ayu.xml", "values-pt/ayu.xml"]:
@@ -635,6 +665,27 @@ jobs:
               open(p, "w", encoding="utf-8").write(s.replace("AyuGram", "JojoGram"))
           print("renamed visible strings")
           PY_EOF
+          python3 - <<'PY2_EOF'
+          import re
+          # JojoGram: show hidden premium-emoji markers (non-fatal: build continues if it cannot patch)
+          p = "TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"
+          s = open(p, encoding="utf-8").read()
+          call = "entities = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(spannable, entities);"
+          if call in s:
+              print("display hook already patched")
+          else:
+              m = re.search(r"replaceAnimatedEmoji\([^)]*boolean top\)\s*\{", s)
+              done = False
+              if m:
+                  pat = re.compile(r"([ \t]*)if \(entities == null\) \{\s*return spannable;\s*\}")
+                  m2 = pat.search(s, m.end())
+                  if m2:
+                      ins = m2.group(1) + call + "\n"
+                      s = s[:m2.start()] + ins + s[m2.start():]
+                      open(p, "w", encoding="utf-8").write(s)
+                      done = True
+              print("display hook patched" if done else "WARNING: display hook NOT patched")
+          PY2_EOF
           echo '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' | base64 -d > TMessagesProj/config/extera.jks
           {
             echo 'APP_ID = 6'
@@ -645,6 +696,16 @@ jobs:
             echo 'SIGNING_KEY_PASSWORD = jojogram123'
           } > API_KEYS
 
+
+      - name: Debug - find send hook
+        run: |
+          F=$(find . -name SendMessagesHelper.java | head -n 1)
+          echo "FILE: $F"
+          grep -n "void sendMessage(SendMessageParams" "$F" || true
+          L=$(grep -n "void sendMessage(SendMessageParams" "$F" | head -n 1 | cut -d: -f1)
+          if [ -n "$L" ]; then sed -n "${L},$((L+45))p" "$F"; fi
+          echo "---- display hook check ----"
+          grep -n "PremiumEmojiMarker" TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java || echo "display hook NOT found"
       - uses: actions/setup-java@v4
         with:
           distribution: temurin

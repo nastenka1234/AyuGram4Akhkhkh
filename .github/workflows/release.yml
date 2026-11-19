@@ -453,6 +453,97 @@ jobs:
               }
           }
           JAVA_EOF
+          cat > $D/JojoEmoji.java <<'JAVA_EOF'
+          package com.radolyn.ayugram;
+
+          import org.telegram.messenger.UserConfig;
+          import org.telegram.tgnet.TLRPC;
+
+          import java.util.ArrayList;
+
+          /**
+           * JojoGram: premium (custom) emoji between JojoGram users.
+           * The Telegram server only accepts custom emoji from real Premium accounts.
+           * So when the sender is NOT really premium, each custom emoji is sent as a normal
+           * emoji character carrying a link  tg://emoji?id=NUMBER  (links are allowed for everyone).
+           * JojoGram on the receiving side turns that link back into the animated custom emoji.
+           * Official Telegram users see a normal emoji (that is a link).
+           */
+          public class JojoEmoji {
+
+              public static final String PREFIX = "tg://emoji?id=";
+
+              /** Sending side: custom emoji -> marker link (only if the account is not really premium). */
+              public static ArrayList<TLRPC.MessageEntity> toMarkers(int account, ArrayList<TLRPC.MessageEntity> entities) {
+                  if (entities == null || entities.isEmpty()) {
+                      return entities;
+                  }
+                  try {
+                      TLRPC.User me = UserConfig.getInstance(account).getCurrentUser();
+                      if (me != null && me.premium) {
+                          return entities;
+                      }
+                      boolean has = false;
+                      for (int i = 0; i < entities.size(); i++) {
+                          if (entities.get(i) instanceof TLRPC.TL_messageEntityCustomEmoji) {
+                              has = true;
+                              break;
+                          }
+                      }
+                      if (!has) {
+                          return entities;
+                      }
+                      ArrayList<TLRPC.MessageEntity> out = new ArrayList<>(entities.size());
+                      for (int i = 0; i < entities.size(); i++) {
+                          TLRPC.MessageEntity e = entities.get(i);
+                          if (e instanceof TLRPC.TL_messageEntityCustomEmoji) {
+                              TLRPC.TL_messageEntityCustomEmoji ce = (TLRPC.TL_messageEntityCustomEmoji) e;
+                              TLRPC.TL_messageEntityTextUrl u = new TLRPC.TL_messageEntityTextUrl();
+                              u.offset = ce.offset;
+                              u.length = ce.length;
+                              u.url = PREFIX + ce.document_id;
+                              out.add(u);
+                          } else {
+                              out.add(e);
+                          }
+                      }
+                      return out;
+                  } catch (Throwable t) {
+                      return entities;
+                  }
+              }
+
+              /** Receiving side: marker link -> real custom emoji entity. Changes the list in place; safe to call many times. */
+              public static void fromMarkers(ArrayList<TLRPC.MessageEntity> entities) {
+                  if (entities == null || entities.isEmpty()) {
+                      return;
+                  }
+                  try {
+                      for (int i = 0; i < entities.size(); i++) {
+                          TLRPC.MessageEntity e = entities.get(i);
+                          if (e instanceof TLRPC.TL_messageEntityTextUrl) {
+                              String url = ((TLRPC.TL_messageEntityTextUrl) e).url;
+                              if (url != null && url.startsWith(PREFIX)) {
+                                  long id;
+                                  try {
+                                      id = Long.parseLong(url.substring(PREFIX.length()).trim());
+                                  } catch (NumberFormatException ex) {
+                                      continue;
+                                  }
+                                  TLRPC.TL_messageEntityCustomEmoji c = new TLRPC.TL_messageEntityCustomEmoji();
+                                  c.offset = e.offset;
+                                  c.length = e.length;
+                                  c.document_id = id;
+                                  entities.set(i, c);
+                              }
+                          }
+                      }
+                  } catch (Throwable t) {
+                      // never break chat rendering because of this
+                  }
+              }
+          }
+          JAVA_EOF
           python3 - <<'PY_EOF'
           import sys
           J = "TMessagesProj/src/main/java/"
@@ -484,6 +575,57 @@ jobs:
           edit(J + "org/telegram/ui/Cells/ChatMessageCell.java",
                "} else if (currentUser.premium) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();",
                "} else if (currentUser.premium || com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();")
+
+          # 4) premium emoji between JojoGram users (see JojoEmoji.java)
+          import re
+
+          def regex_patch(path, pattern, make_insert, label):
+              import os
+              if not os.path.exists(path):
+                  print("WARNING: file not found (" + label + "): " + path)
+                  return
+              s = open(path, encoding="utf-8").read()
+              count = 0
+              out = []
+              pos = 0
+              for m in re.finditer(pattern, s):
+                  ins = make_insert(m)
+                  if ins is None:
+                      continue
+                  if ins in s[m.end():m.end() + len(ins) + 5]:
+                      continue
+                  out.append(s[pos:m.end()])
+                  out.append(ins)
+                  pos = m.end()
+                  count += 1
+              out.append(s[pos:])
+              if count == 0:
+                  if "JojoEmoji." in s:
+                      print("already patched:", label)
+                      return
+                  print("WARNING: could not patch (" + label + ") - build continues WITHOUT this part")
+                  return
+              open(path, "w", encoding="utf-8").write("".join(out))
+              print("patched", count, "place(s):", label)
+
+          # receiving: every addEntitiesToText(...) that has an entities list parameter
+          def recv_insert(m):
+              mm = re.search(r"ArrayList<TLRPC\.MessageEntity>\s+(\w+)", m.group(1))
+              if not mm:
+                  return None
+              return "\n        com.radolyn.ayugram.JojoEmoji.fromMarkers(" + mm.group(1) + ");"
+
+          regex_patch(J + "org/telegram/messenger/MessageObject.java",
+                      r"\baddEntitiesToText\s*\(([^)]*)\)\s*\{",
+                      recv_insert, "receive custom emoji")
+
+          # sending: the main sendMessage(SendMessageParams ...) method
+          def send_insert(m):
+              return "\n        " + m.group(1) + ".entities = com.radolyn.ayugram.JojoEmoji.toMarkers(currentAccount, " + m.group(1) + ".entities);"
+
+          regex_patch(J + "org/telegram/messenger/SendMessagesHelper.java",
+                      r"public\s+void\s+sendMessage\s*\(\s*SendMessageParams\s+(\w+)\s*\)\s*\{",
+                      send_insert, "send custom emoji")
 
           # 3) visible name AyuGram -> JojoGram (resources only)
           for f in ["values/ayu.xml", "values/extera.xml", "values-es/ayu.xml", "values-uk/ayu.xml",

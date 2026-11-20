@@ -15,6 +15,9 @@ jobs:
           submodules: false
 
       - name: Apply JojoGram changes
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
         run: |
           set -e
           D=TMessagesProj/src/main/java/com/radolyn/ayugram
@@ -657,59 +660,107 @@ jobs:
                "} else if (currentUser.premium) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();",
                "} else if (currentUser.premium || com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();")
 
-          # 3) visible name AyuGram -> JojoGram (resources only)
-          for f in ["values/ayu.xml", "values/extera.xml", "values-es/ayu.xml", "values-uk/ayu.xml",
-                    "values-ru/ayu.xml", "values-be/ayu.xml", "values-pt/ayu.xml"]:
-              p = "TMessagesProj/src/main/res/" + f
+          # 3) visible name AyuGram -> JojoGram (text inside XML elements only, links are skipped)
+          import glob, re
+          pat = re.compile(r">([^<>]*AyuGram[^<>]*)<")
+          def fix(m):
+              t = m.group(1)
+              if "http" in t or "t.me" in t or "github" in t.lower():
+                  return m.group(0)
+              return ">" + t.replace("AyuGram", "JojoGram") + "<"
+          changed = 0
+          for p in glob.glob("TMessagesProj/src/main/res/values*/*.xml"):
               s = open(p, encoding="utf-8").read()
-              open(p, "w", encoding="utf-8").write(s.replace("AyuGram", "JojoGram"))
-          print("renamed visible strings")
+              n = pat.sub(fix, s)
+              if n != s:
+                  open(p, "w", encoding="utf-8").write(n)
+                  changed += 1
+          print("renamed visible strings in", changed, "files")
           PY_EOF
           python3 - <<'PY2_EOF'
           import re
-          # JojoGram: show hidden premium-emoji markers (non-fatal: build continues if it cannot patch)
+          # JojoGram: show hidden premium-emoji markers (wrapper method, safe for lambdas; non-fatal)
           p = "TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"
           s = open(p, encoding="utf-8").read()
-          call = "entities = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(spannable, entities);"
-          if call in s:
+          if "replaceAnimatedEmojiJojoImpl" in s:
               print("display hook already patched")
           else:
-              m = re.search(r"replaceAnimatedEmoji\([^)]*boolean top\)\s*\{", s)
-              done = False
-              if m:
-                  pat = re.compile(r"([ \t]*)if \(entities == null\) \{\s*return spannable;\s*\}")
-                  m2 = pat.search(s, m.end())
-                  if m2:
-                      ins = m2.group(1) + call + "\n"
-                      s = s[:m2.start()] + ins + s[m2.start():]
+              pat = re.compile(r"([ \t]*(?:public |private |protected )?(?:static )?(?:final )?([\w<>\[\].]+) )replaceAnimatedEmoji\(([^)]*boolean top)\)(\s*\{)")
+              ms = pat.findall(s)
+              if len(ms) != 1:
+                  print("WARNING: display hook NOT patched (matches: %d)" % len(ms))
+              else:
+                  m = pat.search(s)
+                  ret, params = m.group(2), m.group(3)
+                  parts, depth, cur = [], 0, ""
+                  for ch in params:
+                      if ch == "<": depth += 1
+                      if ch == ">": depth -= 1
+                      if ch == "," and depth == 0:
+                          parts.append(cur); cur = ""
+                      else:
+                          cur += ch
+                  parts.append(cur)
+                  names = [x.strip().split()[-1] for x in parts]
+                  ent = [x.strip().split()[-1] for x in parts if "MessageEntity" in x]
+                  if len(ent) != 1:
+                      print("WARNING: display hook NOT patched (entities param not found)")
+                  else:
+                      txt, e = names[0], ent[0]
+                      call = "replaceAnimatedEmojiJojoImpl(" + ", ".join(names) + ");"
+                      body = ("\n        try { " + e + " = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(" + txt + ", " + e + "); } catch (Throwable jojoT) {}\n        "
+                              + ("" if ret == "void" else "return ") + call + "\n    }\n\n")
+                      new = m.group(1) + "replaceAnimatedEmoji(" + params + ")" + m.group(4) + body + m.group(1) + "replaceAnimatedEmojiJojoImpl(" + params + ")" + m.group(4)
+                      s = s[:m.start()] + new + s[m.end():]
                       open(p, "w", encoding="utf-8").write(s)
-                      done = True
-              print("display hook patched" if done else "WARNING: display hook NOT patched")
+                      print("display hook patched")
           PY2_EOF
           python3 - <<'PY3_EOF'
-          import re
+          import re, sys
           # JojoGram: put hidden markers after premium emoji when sending text (non-fatal)
           p = "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"
           s = open(p, encoding="utf-8").read()
-          if "PremiumEmojiMarker.addMarkers" in s:
+          if "sendMessageJojoImpl" in s:
               print("send hook already patched")
           else:
-              m = re.search(r"public void sendMessage\(SendMessageParams\s+(\w+)\)\s*\{", s)
-              if m:
-                  v = m.group(1)
-                  code = ("\n        try { if (%s != null && %s.message != null && %s.entities != null && !%s.entities.isEmpty()) { "
-                          "com.jojogram.premiumemoji.PremiumEmojiMarker.Result jojoR = com.jojogram.premiumemoji.PremiumEmojiMarker.addMarkers(%s.message, %s.entities); "
-                          "%s.message = jojoR.text; %s.entities = jojoR.entities; } } catch (Throwable jojoT) {}\n") % ((v,)*8)
-                  s = s[:m.end()] + code + s[m.end():]
+              pat = re.compile(r"(private void sendMessage\()(String message, String caption,[^{;]*?MessageObject retryMessageObject,[^{;]*?ArrayList<TLRPC\.MessageEntity> entities,[^{;]*?boolean hasMediaSpoilers)(\)\s*\{)")
+              ms = pat.findall(s)
+              names = ["message","caption","location","photo","videoEditedInfo","user","document","game","poll","invoice","peer","path","replyToMsg","replyToTopMsg","webPage","searchLinks","retryMessageObject","entities","replyMarkup","params","notify","scheduleDate","ttl","parentObject","sendAnimationData","updateStickersOrder","hasMediaSpoilers"]
+              if len(ms) != 1:
+                  print("WARNING: send hook NOT patched (matches: %d)" % len(ms))
+              elif not all(re.search(r"\b" + n + r"\b", ms[0][1]) for n in names):
+                  print("WARNING: send hook NOT patched (parameter names differ)")
+              else:
+                  m = pat.search(s)
+                  body = ("\n        try { if (retryMessageObject == null && message != null && entities != null && !entities.isEmpty()) { "
+                          "com.jojogram.premiumemoji.PremiumEmojiMarker.Result jojoR = com.jojogram.premiumemoji.PremiumEmojiMarker.addMarkers(message, entities); "
+                          "message = jojoR.text; entities = jojoR.entities; } } catch (Throwable jojoT) {}\n"
+                          "        sendMessageJojoImpl(" + ", ".join(names) + ");\n    }\n\n    ")
+                  new = m.group(1) + m.group(2) + m.group(3) + body + "private void sendMessageJojoImpl(" + m.group(2) + m.group(3)
+                  s = s[:m.start()] + new + s[m.end():]
                   open(p, "w", encoding="utf-8").write(s)
                   print("send hook patched")
-              else:
-                  print("WARNING: send hook NOT patched")
           PY3_EOF
+          python3 - <<'PY4_EOF'
+          import re
+          # JojoGram: show premium emoji packs in the picker by treating the account as premium locally (non-fatal)
+          p = "TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java"
+          s = open(p, encoding="utf-8").read()
+          if "JOJO_FAKE_PREMIUM" in s:
+              print("premium unlock already patched")
+          else:
+              m = re.search(r"public boolean isPremium\(\)\s*\{", s)
+              if m:
+                  s = s[:m.end()] + "\n        if (true) { return true; } // JOJO_FAKE_PREMIUM" + s[m.end():]
+                  open(p, "w", encoding="utf-8").write(s)
+                  print("premium unlock patched")
+              else:
+                  print("WARNING: premium unlock NOT patched")
+          PY4_EOF
           echo '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' | base64 -d > TMessagesProj/config/extera.jks
           {
-            echo 'APP_ID = 2040'
-            echo 'APP_HASH = "b18441a1ff607e10a989891a5462e627"'
+            echo "APP_ID = ${TG_API_ID:-2040}"
+            echo "APP_HASH = \"${TG_API_HASH:-b18441a1ff607e10a989891a5462e627}\""
             echo 'MAPS_V2_API = none'
             echo 'SIGNING_KEY_STORE_PASSWORD = jojogram123'
             echo 'SIGNING_KEY_ALIAS = jojo'
@@ -728,6 +779,19 @@ jobs:
           grep -n "PremiumEmojiMarker" TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java || echo "display hook NOT found"
           echo "---- send hook check ----"
           grep -n "PremiumEmojiMarker" "$F" || echo "send hook NOT found"
+          echo "---- premium unlock check ----"
+          grep -n "JOJO_FAKE_PREMIUM" TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java || echo "premium unlock NOT found"
+      - name: Debug - emoji panel
+        run: |
+          J=TMessagesProj/src/main/java/org/telegram
+          echo "==== MediaDataController 7485-7510 ===="
+          sed -n 7485,7510p $J/messenger/MediaDataController.java | cut -c1-200
+          echo "==== featured emoji in MediaDataController ===="
+          grep -n "getFeaturedEmojiSets\|loadFeaturedEmoji\|FEATURED_EMOJI\|featuredEmojiSets" $J/messenger/MediaDataController.java | cut -c1-180 | head -n 20 || true
+          echo "==== featuredEmojiSets in EmojiView ===="
+          grep -n "featuredEmojiSets" $J/ui/Components/EmojiView.java | cut -c1-200 | head -n 20 || true
+          echo "==== setAllowStickersAndGifs callers ===="
+          grep -rn "setAllowStickersAndGifs(" $J/ui/ChatActivity.java | cut -c1-220 | head -n 10 || true
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -748,7 +812,19 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleAfatRelease --no-daemon -Pandroid.injected.build.abi=arm64-v8a
 
+      - name: Collect APK
+        run: |
+          mkdir -p jojo-out
+          find . -path "*/build/outputs/*" -name "*.apk" -not -path "./jojo-out/*" -exec cp -v {} jojo-out/ \;
+          ls -la jojo-out
+          if [ -z "$(ls -A jojo-out)" ]; then
+            echo "NO APK FOUND. Listing build outputs:"
+            find . -path "*/build/outputs/*" | head -n 50
+            exit 1
+          fi
+
       - uses: actions/upload-artifact@v4
         with:
           name: JojoGram-APK
-          path: TMessagesProj/build/outputs/apk/afat/release/*.apk
+          path: jojo-out/*.apk
+          if-no-files-found: error

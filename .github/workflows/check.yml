@@ -759,16 +759,24 @@ jobs:
           echo "---- premium unlock check ----"
           grep -n "JOJO_FAKE_PREMIUM" TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java || echo "premium unlock NOT found"
 
-      - name: Extra diagnostics
+      - name: Diagnostics 2 (send method)
         run: |
-          J=TMessagesProj/src/main/java
-          echo "==== replaceAnimatedEmoji signature ===="
-          grep -n "replaceAnimatedEmoji(" $J/org/telegram/messenger/MessageObject.java | head -n 5 || true
-          echo "==== UserConfig.isPremium ===="
-          grep -n -A3 "boolean isPremium()" $J/org/telegram/messenger/UserConfig.java || true
-          echo "==== how emoji picker decides premium ===="
-          grep -n "isPremium()\|premiumFeaturesBlocked\|premiumLocked" $J/org/telegram/ui/Components/EmojiView.java | head -n 40 || true
-          echo "==== premium helpers in MessagesController ===="
-          grep -n "premiumFeaturesBlocked\|premiumLocked\|boolean isPremiumUser" $J/org/telegram/messenger/MessagesController.java | head -n 20 || true
-          echo "==== AyuConfig localPremium ===="
-          grep -rn "localPremium" $J/com/radolyn/ayugram | head -n 10 || true
+          S=TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
+          echo "==== all sendMessage declarations ===="
+          grep -nE "^\s*(public|private|protected|static|synchronized).*\bsendMessage\(" $S | head -n 30 || true
+          echo "==== SendMessageParams mentions ===="
+          grep -n "SendMessageParams" $S | head -n 25 || true
+          echo "==== class SendMessageParams (fields) ===="
+          L=$(grep -n "class SendMessageParams" $S | head -n 1 | cut -d: -f1)
+          if [ -n "$L" ]; then sed -n "${L},$((L+40))p" $S; fi
+      - name: Diagnostics 3 (emoji panel)
+        run: |
+          J=TMessagesProj/src/main/java/org/telegram/ui/Components
+          echo "==== EmojiView 560-590 ===="
+          sed -n 560,590p $J/EmojiView.java
+          echo "==== EmojiView 5515-5545 ===="
+          sed -n 5515,5545p $J/EmojiView.java
+          echo "==== allowAnimatedEmoji ===="
+          grep -rn "allowAnimatedEmoji" TMessagesProj/src/main/java/org/telegram/ui --include=*.java | head -n 25 || true
+          echo "==== premiumFeaturesBlocked ===="
+          grep -rn "premiumFeaturesBlocked()" TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java | head -n 5 || true

@@ -679,44 +679,67 @@ jobs:
           PY_EOF
           python3 - <<'PY2_EOF'
           import re
-          # JojoGram: show hidden premium-emoji markers (non-fatal: build continues if it cannot patch)
+          # JojoGram: show hidden premium-emoji markers (wrapper method, safe for lambdas; non-fatal)
           p = "TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"
           s = open(p, encoding="utf-8").read()
-          call = "entities = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(spannable, entities);"
-          if call in s:
+          if "replaceAnimatedEmojiJojoImpl" in s:
               print("display hook already patched")
           else:
-              m = re.search(r"replaceAnimatedEmoji\([^)]*boolean top\)\s*\{", s)
-              done = False
-              if m:
-                  pat = re.compile(r"([ \t]*)if \(entities == null\) \{\s*return spannable;\s*\}")
-                  m2 = pat.search(s, m.end())
-                  if m2:
-                      ins = m2.group(1) + call + "\n"
-                      s = s[:m2.start()] + ins + s[m2.start():]
+              pat = re.compile(r"([ \t]*(?:public |private |protected )?(?:static )?(?:final )?([\w<>\[\].]+) )replaceAnimatedEmoji\(([^)]*boolean top)\)(\s*\{)")
+              ms = pat.findall(s)
+              if len(ms) != 1:
+                  print("WARNING: display hook NOT patched (matches: %d)" % len(ms))
+              else:
+                  m = pat.search(s)
+                  ret, params = m.group(2), m.group(3)
+                  parts, depth, cur = [], 0, ""
+                  for ch in params:
+                      if ch == "<": depth += 1
+                      if ch == ">": depth -= 1
+                      if ch == "," and depth == 0:
+                          parts.append(cur); cur = ""
+                      else:
+                          cur += ch
+                  parts.append(cur)
+                  names = [x.strip().split()[-1] for x in parts]
+                  ent = [x.strip().split()[-1] for x in parts if "MessageEntity" in x]
+                  if len(ent) != 1:
+                      print("WARNING: display hook NOT patched (entities param not found)")
+                  else:
+                      txt, e = names[0], ent[0]
+                      call = "replaceAnimatedEmojiJojoImpl(" + ", ".join(names) + ");"
+                      body = ("\n        try { " + e + " = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(" + txt + ", " + e + "); } catch (Throwable jojoT) {}\n        "
+                              + ("" if ret == "void" else "return ") + call + "\n    }\n\n")
+                      new = m.group(1) + "replaceAnimatedEmoji(" + params + ")" + m.group(4) + body + m.group(1) + "replaceAnimatedEmojiJojoImpl(" + params + ")" + m.group(4)
+                      s = s[:m.start()] + new + s[m.end():]
                       open(p, "w", encoding="utf-8").write(s)
-                      done = True
-              print("display hook patched" if done else "WARNING: display hook NOT patched")
+                      print("display hook patched")
           PY2_EOF
           python3 - <<'PY3_EOF'
-          import re
+          import re, sys
           # JojoGram: put hidden markers after premium emoji when sending text (non-fatal)
           p = "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"
           s = open(p, encoding="utf-8").read()
-          if "PremiumEmojiMarker.addMarkers" in s:
+          if "sendMessageJojoImpl" in s:
               print("send hook already patched")
           else:
-              m = re.search(r"public void sendMessage\(SendMessageParams\s+(\w+)\)\s*\{", s)
-              if m:
-                  v = m.group(1)
-                  code = ("\n        try { if (%s != null && %s.message != null && %s.entities != null && !%s.entities.isEmpty()) { "
-                          "com.jojogram.premiumemoji.PremiumEmojiMarker.Result jojoR = com.jojogram.premiumemoji.PremiumEmojiMarker.addMarkers(%s.message, %s.entities); "
-                          "%s.message = jojoR.text; %s.entities = jojoR.entities; } } catch (Throwable jojoT) {}\n") % ((v,)*8)
-                  s = s[:m.end()] + code + s[m.end():]
+              pat = re.compile(r"(private void sendMessage\()(String message, String caption,[^{;]*?MessageObject retryMessageObject,[^{;]*?ArrayList<TLRPC\.MessageEntity> entities,[^{;]*?boolean hasMediaSpoilers)(\)\s*\{)")
+              ms = pat.findall(s)
+              names = ["message","caption","location","photo","videoEditedInfo","user","document","game","poll","invoice","peer","path","replyToMsg","replyToTopMsg","webPage","searchLinks","retryMessageObject","entities","replyMarkup","params","notify","scheduleDate","ttl","parentObject","sendAnimationData","updateStickersOrder","hasMediaSpoilers"]
+              if len(ms) != 1:
+                  print("WARNING: send hook NOT patched (matches: %d)" % len(ms))
+              elif not all(re.search(r"\b" + n + r"\b", ms[0][1]) for n in names):
+                  print("WARNING: send hook NOT patched (parameter names differ)")
+              else:
+                  m = pat.search(s)
+                  body = ("\n        try { if (retryMessageObject == null && message != null && entities != null && !entities.isEmpty()) { "
+                          "com.jojogram.premiumemoji.PremiumEmojiMarker.Result jojoR = com.jojogram.premiumemoji.PremiumEmojiMarker.addMarkers(message, entities); "
+                          "message = jojoR.text; entities = jojoR.entities; } } catch (Throwable jojoT) {}\n"
+                          "        sendMessageJojoImpl(" + ", ".join(names) + ");\n    }\n\n    ")
+                  new = m.group(1) + m.group(2) + m.group(3) + body + "private void sendMessageJojoImpl(" + m.group(2) + m.group(3)
+                  s = s[:m.start()] + new + s[m.end():]
                   open(p, "w", encoding="utf-8").write(s)
                   print("send hook patched")
-              else:
-                  print("WARNING: send hook NOT patched")
           PY3_EOF
           python3 - <<'PY4_EOF'
           import re
@@ -758,25 +781,21 @@ jobs:
           grep -n "PremiumEmojiMarker" "$F" || echo "send hook NOT found"
           echo "---- premium unlock check ----"
           grep -n "JOJO_FAKE_PREMIUM" TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java || echo "premium unlock NOT found"
-
-      - name: Diagnostics 2 (send method)
+      - name: RESULT (copy this whole step)
         run: |
-          S=TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java
-          echo "==== all sendMessage declarations ===="
-          grep -nE "^\s*(public|private|protected|static|synchronized).*\bsendMessage\(" $S | head -n 30 || true
-          echo "==== SendMessageParams mentions ===="
-          grep -n "SendMessageParams" $S | head -n 25 || true
-          echo "==== class SendMessageParams (fields) ===="
-          L=$(grep -n "class SendMessageParams" $S | head -n 1 | cut -d: -f1)
-          if [ -n "$L" ]; then sed -n "${L},$((L+40))p" $S; fi
-      - name: Diagnostics 3 (emoji panel)
-        run: |
-          J=TMessagesProj/src/main/java/org/telegram/ui/Components
-          echo "==== EmojiView 560-590 ===="
-          sed -n 560,590p $J/EmojiView.java
-          echo "==== EmojiView 5515-5545 ===="
-          sed -n 5515,5545p $J/EmojiView.java
-          echo "==== allowAnimatedEmoji ===="
-          grep -rn "allowAnimatedEmoji" TMessagesProj/src/main/java/org/telegram/ui --include=*.java | head -n 25 || true
-          echo "==== premiumFeaturesBlocked ===="
-          grep -rn "premiumFeaturesBlocked()" TMessagesProj/src/main/java/org/telegram/messenger/MessagesController.java | head -n 5 || true
+          M=TMessagesProj/src/main/java/org/telegram/messenger
+          U=TMessagesProj/src/main/java/org/telegram/ui/Components
+          echo "==== SEND HOOK ===="
+          grep -c "sendMessageJojoImpl" $M/SendMessagesHelper.java || true
+          echo "==== DISPLAY HOOK ===="
+          grep -n "replaceAnimatedEmojiJojoImpl\|withHiddenEntities" $M/MessageObject.java | cut -c1-170 || true
+          echo "==== ChatActivityEnterView 4480-4496 ===="
+          sed -n 4480,4496p $U/ChatActivityEnterView.java | cut -c1-200
+          echo "==== EmojiView 4010-4050 ===="
+          sed -n 4010,4050p $U/EmojiView.java | cut -c1-200
+          echo "==== EmojiView 6730-6742 ===="
+          sed -n 6730,6742p $U/EmojiView.java | cut -c1-200
+          echo "==== EmojiView 6915-6925 ===="
+          sed -n 6915,6925p $U/EmojiView.java | cut -c1-240
+          echo "==== MediaDataController isPremium uses ===="
+          grep -n "isPremium()" $M/MediaDataController.java | cut -c1-200 | head -n 30

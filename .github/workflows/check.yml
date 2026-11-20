@@ -1,0 +1,774 @@
+name: Check JojoGram patches (no build)
+# Everything is in this one file: it downloads the public AyuGram source,
+# applies the JojoGram changes and builds the APK. Nothing else to upload.
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: AyuGram/AyuGram4A
+          ref: rewrite
+          submodules: false
+
+      - name: Apply JojoGram changes
+        env:
+          TG_API_ID: ${{ secrets.TG_API_ID }}
+          TG_API_HASH: ${{ secrets.TG_API_HASH }}
+        run: |
+          set -e
+          D=TMessagesProj/src/main/java/com/radolyn/ayugram
+          mkdir -p $D/history
+          cat > $D/CustomBadge.java <<'JAVA_EOF'
+          package com.radolyn.ayugram;
+
+          import java.util.HashSet;
+          import java.util.Set;
+
+          /**
+           * Telegram user IDs that get a badge next to their name inside THIS modified app only.
+           * This is NOT real Telegram Premium: people using the official app will not see it.
+           *
+           * To add someone: write  BADGE_USER_IDS.add(123456789L);  inside the static block below.
+           */
+          public class CustomBadge {
+
+              private static final Set<Long> BADGE_USER_IDS = new HashSet<Long>();
+
+              static {
+                  // BADGE_USER_IDS.add(123456789L);
+                  // BADGE_USER_IDS.add(987654321L);
+              }
+
+              public static boolean has(long userId) {
+                  return userId != 0 && BADGE_USER_IDS.contains(userId);
+              }
+          }
+          JAVA_EOF
+          cat > $D/history/AyuMessageUtils.java <<'JAVA_EOF'
+          package com.radolyn.ayugram.history;
+
+          import android.text.TextUtils;
+          import androidx.core.util.Pair;
+
+          import com.google.android.exoplayer2.util.Log;
+          import com.radolyn.ayugram.AyuConstants;
+          import com.radolyn.ayugram.AyuUtils;
+          import com.radolyn.ayugram.database.entities.AyuMessageBase;
+          import com.radolyn.ayugram.messages.AyuMessagesController;
+          import com.radolyn.ayugram.messages.AyuSavePreferences;
+
+          import org.telegram.messenger.AndroidUtilities;
+          import org.telegram.messenger.ChatObject;
+          import org.telegram.messenger.FileLoader;
+          import org.telegram.messenger.MessageObject;
+          import org.telegram.messenger.MessagesController;
+          import org.telegram.tgnet.SerializedData;
+          import org.telegram.tgnet.TLRPC;
+
+          import java.io.File;
+          import java.util.ArrayList;
+
+          /**
+           * JojoGram: open replacement for the closed-source "proprietary" mapping code.
+           * Converts TLRPC messages to database entities (save) and back (show in chat).
+           */
+          public class AyuMessageUtils {
+
+              // ------------------------------------------------------------------ message -> entity
+
+              public static void map(AyuSavePreferences prefs, AyuMessageBase base) {
+                  base.userId = prefs.getUserId();
+                  base.dialogId = prefs.getDialogId();
+                  base.topicId = prefs.getTopicId();
+                  base.messageId = prefs.getMessageId();
+                  base.entityCreateDate = prefs.getRequestCatchTime();
+
+                  TLRPC.Message msg = prefs.getMessage();
+                  if (msg == null) {
+                      return;
+                  }
+
+                  base.groupedId = msg.grouped_id;
+                  base.peerId = msg.peer_id != null ? MessageObject.getPeerId(msg.peer_id) : prefs.getDialogId();
+                  base.fromId = msg.from_id != null ? MessageObject.getPeerId(msg.from_id) : 0;
+                  base.date = msg.date;
+                  base.flags = msg.flags;
+                  base.editDate = msg.edit_date;
+                  base.views = msg.views;
+
+                  if (msg.fwd_from != null) {
+                      base.fwdFlags = msg.fwd_from.flags;
+                      base.fwdFromId = msg.fwd_from.from_id != null ? MessageObject.getPeerId(msg.fwd_from.from_id) : 0;
+                      base.fwdName = msg.fwd_from.from_name;
+                      base.fwdDate = msg.fwd_from.date;
+                      base.fwdPostAuthor = msg.fwd_from.post_author;
+                  }
+
+                  if (msg.reply_to != null) {
+                      base.replyFlags = msg.reply_to.flags;
+                      base.replyMessageId = msg.reply_to.reply_to_msg_id;
+                      base.replyPeerId = msg.reply_to.reply_to_peer_id != null ? MessageObject.getPeerId(msg.reply_to.reply_to_peer_id) : 0;
+                      base.replyTopId = msg.reply_to.reply_to_top_id;
+                      base.replyForumTopic = msg.reply_to.forum_topic;
+                  }
+
+                  base.text = msg.message;
+                  base.textEntities = serializeEntities(msg.entities);
+              }
+
+              public static void mapMedia(AyuSavePreferences prefs, AyuMessageBase base, boolean saveFiles) {
+                  TLRPC.Message msg = prefs.getMessage();
+                  if (msg == null || msg.media == null) {
+                      return;
+                  }
+
+                  int account = prefs.getAccountId();
+
+                  try {
+                      if (msg.media instanceof TLRPC.TL_messageMediaPhoto && msg.media.photo != null) {
+                          base.documentType = AyuConstants.DOCUMENT_TYPE_PHOTO;
+                          String path = saveFile(account, msg, saveFiles);
+                          base.mediaPath = path;
+                          base.hqThumbPath = path;
+                      } else if (msg.media instanceof TLRPC.TL_messageMediaDocument && msg.media.document != null) {
+                          TLRPC.Document doc = msg.media.document;
+                          base.mimeType = doc.mime_type;
+                          base.documentType = MessageObject.isStickerDocument(doc) ? AyuConstants.DOCUMENT_TYPE_STICKER : AyuConstants.DOCUMENT_TYPE_FILE;
+
+                          SerializedData data = new SerializedData(doc.getObjectSize());
+                          doc.serializeToStream(data);
+                          base.documentSerialized = data.toByteArray();
+                          data.cleanup();
+
+                          base.mediaPath = saveFile(account, msg, saveFiles);
+                      }
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "mapMedia failed", e);
+                  }
+              }
+
+              private static String saveFile(int account, TLRPC.Message msg, boolean copyToSaved) {
+                  File src = null;
+                  if (!TextUtils.isEmpty(msg.attachPath)) {
+                      File f = new File(msg.attachPath);
+                      if (f.exists()) {
+                          src = f;
+                      }
+                  }
+                  if (src == null) {
+                      File f = FileLoader.getInstance(account).getPathToMessage(msg);
+                      if (f != null && f.exists()) {
+                          src = f;
+                      }
+                  }
+                  if (src == null) {
+                      return null;
+                  }
+                  if (!copyToSaved) {
+                      return src.getAbsolutePath();
+                  }
+
+                  try {
+                      File dir = AyuMessagesController.attachmentsPath;
+                      if (!dir.exists()) {
+                          dir.mkdirs();
+                      }
+                      File dst = new File(dir, AyuUtils.getFilename(msg, src));
+                      if (AndroidUtilities.copyFile(src, dst)) {
+                          return dst.getAbsolutePath();
+                      }
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "failed to save attachment", e);
+                  }
+                  return src.getAbsolutePath();
+              }
+
+              // ------------------------------------------------------------------ entity -> message
+
+              public static void map(AyuMessageBase base, TLRPC.Message msg, int account) {
+                  msg.id = base.messageId;
+                  msg.dialog_id = base.dialogId;
+                  msg.date = base.date;
+                  msg.edit_date = base.editDate;
+                  msg.views = base.views;
+                  msg.grouped_id = base.groupedId;
+                  msg.message = base.text != null ? base.text : "";
+                  msg.flags = base.flags;
+                  msg.out = (base.flags & 2) != 0;
+
+                  msg.peer_id = makePeer(account, base.peerId != 0 ? base.peerId : base.dialogId);
+                  if (base.fromId != 0) {
+                      msg.from_id = makePeer(account, base.fromId);
+                      msg.flags |= TLRPC.MESSAGE_FLAG_HAS_FROM_ID;
+                  }
+
+                  ArrayList<TLRPC.MessageEntity> entities = deserializeEntities(base.textEntities);
+                  if (!entities.isEmpty()) {
+                      msg.entities = entities;
+                      msg.flags |= 128;
+                  }
+
+                  if (base.fwdFromId != 0 || !TextUtils.isEmpty(base.fwdName)) {
+                      TLRPC.TL_messageFwdHeader fwd = new TLRPC.TL_messageFwdHeader();
+                      fwd.flags = base.fwdFlags;
+                      if (base.fwdFromId != 0) {
+                          fwd.from_id = makePeer(account, base.fwdFromId);
+                      }
+                      fwd.from_name = base.fwdName;
+                      fwd.date = base.fwdDate;
+                      fwd.post_author = base.fwdPostAuthor;
+                      msg.fwd_from = fwd;
+                      msg.flags |= TLRPC.MESSAGE_FLAG_FWD;
+                  }
+
+                  if (base.replyMessageId != 0 || base.replyTopId != 0) {
+                      TLRPC.TL_messageReplyHeader reply = new TLRPC.TL_messageReplyHeader();
+                      reply.flags = base.replyFlags;
+                      reply.reply_to_msg_id = base.replyMessageId;
+                      reply.reply_to_top_id = base.replyTopId;
+                      reply.forum_topic = base.replyForumTopic;
+                      if (base.replyPeerId != 0) {
+                          reply.reply_to_peer_id = makePeer(account, base.replyPeerId);
+                      }
+                      msg.reply_to = reply;
+                      msg.flags |= TLRPC.MESSAGE_FLAG_REPLY;
+                  }
+              }
+
+              public static void mapMedia(AyuMessageBase base, TLRPC.Message msg) {
+                  if (base.documentType == AyuConstants.DOCUMENT_TYPE_NONE && TextUtils.isEmpty(base.mediaPath)) {
+                      msg.media = new TLRPC.TL_messageMediaEmpty();
+                      return;
+                  }
+
+                  try {
+                      if (base.documentType == AyuConstants.DOCUMENT_TYPE_PHOTO) {
+                          File file = new File(base.mediaPath != null ? base.mediaPath : "");
+                          if (!file.exists()) {
+                              msg.media = new TLRPC.TL_messageMediaEmpty();
+                              return;
+                          }
+
+                          Pair<Integer, Integer> size = AyuUtils.extractImageSizeFromName(file.getName());
+                          if (size == null) {
+                              size = AyuUtils.extractImageSizeFromFile(file.getAbsolutePath());
+                          }
+                          int w = size != null && size.first != null && size.first > 0 ? size.first : 800;
+                          int h = size != null && size.second != null && size.second > 0 ? size.second : 800;
+
+                          TLRPC.TL_photoSize photoSize = new TLRPC.TL_photoSize();
+                          photoSize.type = "x";
+                          photoSize.w = w;
+                          photoSize.h = h;
+                          photoSize.size = (int) file.length();
+                          photoSize.location = new TLRPC.TL_fileLocationToBeDeprecated();
+                          photoSize.location.volume_id = -Math.abs(base.messageId) - 1;
+                          photoSize.location.local_id = -Math.abs(base.messageId) - 1;
+
+                          TLRPC.TL_photo photo = new TLRPC.TL_photo();
+                          photo.date = base.date;
+                          photo.sizes = new ArrayList<>();
+                          photo.sizes.add(photoSize);
+                          photo.file_reference = new byte[0];
+
+                          TLRPC.TL_messageMediaPhoto media = new TLRPC.TL_messageMediaPhoto();
+                          media.photo = photo;
+                          media.flags |= 1;
+                          msg.media = media;
+                          msg.attachPath = file.getAbsolutePath();
+                          msg.flags |= 512;
+                      } else if (base.documentSerialized != null) {
+                          SerializedData data = new SerializedData(base.documentSerialized);
+                          TLRPC.Document doc = TLRPC.Document.TLdeserialize(data, data.readInt32(false), false);
+                          data.cleanup();
+                          if (doc != null) {
+                              TLRPC.TL_messageMediaDocument media = new TLRPC.TL_messageMediaDocument();
+                              media.document = doc;
+                              media.flags |= 1;
+                              msg.media = media;
+                              if (!TextUtils.isEmpty(base.mediaPath) && new File(base.mediaPath).exists()) {
+                                  msg.attachPath = base.mediaPath;
+                              }
+                              msg.flags |= 512;
+                          }
+                      }
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "mapMedia (restore) failed", e);
+                  }
+              }
+
+              // ------------------------------------------------------------------ helpers
+
+              public static TLRPC.Peer makePeer(int account, long id) {
+                  if (id > 0) {
+                      TLRPC.TL_peerUser peer = new TLRPC.TL_peerUser();
+                      peer.user_id = id;
+                      return peer;
+                  }
+                  long chatId = -id;
+                  TLRPC.Chat chat = MessagesController.getInstance(account).getChat(chatId);
+                  if (ChatObject.isChannel(chat)) {
+                      TLRPC.TL_peerChannel peer = new TLRPC.TL_peerChannel();
+                      peer.channel_id = chatId;
+                      return peer;
+                  }
+                  TLRPC.TL_peerChat peer = new TLRPC.TL_peerChat();
+                  peer.chat_id = chatId;
+                  return peer;
+              }
+
+              private static byte[] serializeEntities(ArrayList<TLRPC.MessageEntity> entities) {
+                  if (entities == null || entities.isEmpty()) {
+                      return null;
+                  }
+                  try {
+                      SerializedData data = new SerializedData();
+                      data.writeInt32(entities.size());
+                      for (int i = 0; i < entities.size(); i++) {
+                          entities.get(i).serializeToStream(data);
+                      }
+                      byte[] result = data.toByteArray();
+                      data.cleanup();
+                      return result;
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "serializeEntities failed", e);
+                      return null;
+                  }
+              }
+
+              private static ArrayList<TLRPC.MessageEntity> deserializeEntities(byte[] bytes) {
+                  ArrayList<TLRPC.MessageEntity> result = new ArrayList<>();
+                  if (bytes == null) {
+                      return result;
+                  }
+                  try {
+                      SerializedData data = new SerializedData(bytes);
+                      int count = data.readInt32(false);
+                      for (int i = 0; i < count; i++) {
+                          TLRPC.MessageEntity entity = TLRPC.MessageEntity.TLdeserialize(data, data.readInt32(false), false);
+                          if (entity != null) {
+                              result.add(entity);
+                          }
+                      }
+                      data.cleanup();
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "deserializeEntities failed", e);
+                  }
+                  return result;
+              }
+          }
+          JAVA_EOF
+          cat > $D/history/AyuHistoryHook.java <<'JAVA_EOF'
+          package com.radolyn.ayugram.history;
+
+          import androidx.core.util.Pair;
+          import android.util.SparseArray;
+
+          import com.google.android.exoplayer2.util.Log;
+          import com.radolyn.ayugram.database.entities.DeletedMessageFull;
+          import com.radolyn.ayugram.messages.AyuMessagesController;
+
+          import org.telegram.messenger.MessageObject;
+          import org.telegram.messenger.UserConfig;
+          import org.telegram.tgnet.TLRPC;
+
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.List;
+
+          /**
+           * JojoGram: open replacement for the closed-source history hook.
+           * Puts saved (deleted) messages back into the list that the chat is about to show.
+           */
+          public class AyuHistoryHook {
+
+              /** first = smaller id, second = bigger id */
+              public static Pair<Integer, Integer> getMinAndMaxIds(ArrayList<MessageObject> messArr) {
+                  int min = Integer.MAX_VALUE;
+                  int max = Integer.MIN_VALUE;
+                  for (int i = 0; i < messArr.size(); i++) {
+                      int id = messArr.get(i).getId();
+                      min = Math.min(min, id);
+                      max = Math.max(max, id);
+                  }
+                  return new Pair<>(min, max);
+              }
+
+              public static void doHook(int account, ArrayList<MessageObject> messArr, SparseArray<MessageObject>[] messagesDict,
+                                        int startId, int endId, long dialogId, int limit, long topicId, boolean secret) {
+                  try {
+                      long userId = UserConfig.getInstance(account).getClientUserId();
+                      int lo = Math.min(startId, endId);
+                      int hi = Math.max(startId, endId);
+
+                      List<DeletedMessageFull> saved = AyuMessagesController.getInstance().getMessages(userId, dialogId, topicId, lo, hi, limit);
+                      if (saved == null || saved.isEmpty()) {
+                          return;
+                      }
+
+                      boolean added = false;
+                      for (int i = 0; i < saved.size(); i++) {
+                          DeletedMessageFull full = saved.get(i);
+                          if (full == null || full.message == null) {
+                              continue;
+                          }
+                          int id = full.message.messageId;
+                          if (messagesDict[0].indexOfKey(id) >= 0 || containsId(messArr, id)) {
+                              continue;
+                          }
+
+                          TLRPC.TL_message msg = new TLRPC.TL_message();
+                          AyuMessageUtils.map(full.message, msg, account);
+                          AyuMessageUtils.mapMedia(full.message, msg);
+                          msg.ayuDeleted = true;
+
+                          MessageObject obj = new MessageObject(account, msg, true, true);
+                          messArr.add(obj);
+                          added = true;
+                      }
+
+                      if (added) {
+                          final boolean isSecret = secret;
+                          Collections.sort(messArr, (a, b) -> {
+                              int c = Integer.compare(b.messageOwner.date, a.messageOwner.date);
+                              if (c == 0) {
+                                  c = isSecret ? Integer.compare(a.getId(), b.getId()) : Integer.compare(b.getId(), a.getId());
+                              }
+                              return c;
+                          });
+                      }
+                  } catch (Exception e) {
+                      Log.e("AyuGram", "history hook failed", e);
+                  }
+              }
+
+              private static boolean containsId(ArrayList<MessageObject> list, int id) {
+                  for (int i = 0; i < list.size(); i++) {
+                      if (list.get(i).getId() == id) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+          }
+          JAVA_EOF
+          P=TMessagesProj/src/main/java/com/jojogram/premiumemoji
+          mkdir -p $P
+          cat > $P/PremiumEmojiMarker.java <<'JAVA_EOF'
+          package com.jojogram.premiumemoji;
+
+          import org.telegram.tgnet.TLRPC;
+
+          import java.math.BigInteger;
+          import java.util.ArrayList;
+          import java.util.Collections;
+          import java.util.Comparator;
+
+          public class PremiumEmojiMarker {
+
+              // marker: U+E0001 | 1 hex digit (fallback length) + 16 hex digits (documentId) | U+E007F
+              private static final int TAG_BEGIN = 0xE0001;
+              private static final int TAG_END = 0xE007F;
+              private static final int TAG_BASE = 0xE0000;
+              private static final int MAX_MESSAGE_LENGTH = 4096;
+
+              public static class Result {
+                  public String text;
+                  public ArrayList<TLRPC.MessageEntity> entities;
+              }
+
+              // ---------- sending ----------
+
+              public static String encode(long documentId, int fallbackLength) {
+                  if (fallbackLength < 1 || fallbackLength > 15) {
+                      return "";
+                  }
+                  String payload = Integer.toHexString(fallbackLength) + String.format("%016x", documentId);
+                  StringBuilder sb = new StringBuilder();
+                  sb.appendCodePoint(TAG_BEGIN);
+                  for (int i = 0; i < payload.length(); i++) {
+                      sb.appendCodePoint(TAG_BASE + payload.charAt(i));
+                  }
+                  sb.appendCodePoint(TAG_END);
+                  return sb.toString();
+              }
+
+              public static Result addMarkers(String text, ArrayList<TLRPC.MessageEntity> entities) {
+                  Result r = new Result();
+                  r.text = text;
+                  r.entities = entities;
+                  if (text == null || entities == null || entities.isEmpty()) {
+                      return r;
+                  }
+                  ArrayList<int[]> inserts = new ArrayList<>();
+                  ArrayList<String> markers = new ArrayList<>();
+                  int total = 0;
+                  for (TLRPC.MessageEntity e : entities) {
+                      if (e instanceof TLRPC.TL_messageEntityCustomEmoji) {
+                          int end = e.offset + e.length;
+                          if (e.length < 1 || end > text.length()) {
+                              continue;
+                          }
+                          String m = encode(((TLRPC.TL_messageEntityCustomEmoji) e).document_id, e.length);
+                          if (m.isEmpty()) {
+                              continue;
+                          }
+                          inserts.add(new int[]{end, markers.size()});
+                          markers.add(m);
+                          total += m.length();
+                      }
+                  }
+                  if (inserts.isEmpty() || text.length() + total > MAX_MESSAGE_LENGTH) {
+                      return r;
+                  }
+                  Collections.sort(inserts, new Comparator<int[]>() {
+                      @Override
+                      public int compare(int[] a, int[] b) {
+                          return a[0] - b[0];
+                      }
+                  });
+                  StringBuilder sb = new StringBuilder();
+                  int last = 0;
+                  for (int[] ins : inserts) {
+                      sb.append(text, last, ins[0]).append(markers.get(ins[1]));
+                      last = ins[0];
+                  }
+                  sb.append(text, last, text.length());
+                  for (TLRPC.MessageEntity e : entities) {
+                      int oldStart = e.offset;
+                      int oldEnd = e.offset + e.length;
+                      int shiftStart = 0;
+                      int shiftEnd = 0;
+                      for (int[] ins : inserts) {
+                          int len = markers.get(ins[1]).length();
+                          if (ins[0] <= oldStart) shiftStart += len;
+                          if (ins[0] < oldEnd) shiftEnd += len;
+                      }
+                      e.offset = oldStart + shiftStart;
+                      e.length = (oldEnd + shiftEnd) - e.offset;
+                  }
+                  r.text = sb.toString();
+                  return r;
+              }
+
+              // ---------- display ----------
+
+              public static ArrayList<TLRPC.MessageEntity> withHiddenEntities(CharSequence text, ArrayList<TLRPC.MessageEntity> entities) {
+                  if (text == null) {
+                      return entities;
+                  }
+                  ArrayList<TLRPC.MessageEntity> result = entities;
+                  boolean copied = false;
+                  int n = text.length();
+                  int i = 0;
+                  while (i < n) {
+                      int cp = Character.codePointAt(text, i);
+                      int cc = Character.charCount(cp);
+                      if (cp == TAG_BEGIN) {
+                          int markerStart = i;
+                          int j = i + cc;
+                          StringBuilder payload = new StringBuilder();
+                          boolean ok = false;
+                          while (j < n) {
+                              int c2 = Character.codePointAt(text, j);
+                              int cc2 = Character.charCount(c2);
+                              if (c2 == TAG_END) {
+                                  ok = true;
+                                  j += cc2;
+                                  break;
+                              }
+                              if (c2 < TAG_BASE + 0x20 || c2 > TAG_BASE + 0x7E) {
+                                  break;
+                              }
+                              payload.append((char) (c2 - TAG_BASE));
+                              j += cc2;
+                          }
+                          if (ok && payload.length() == 17) {
+                              try {
+                                  int len = Integer.parseInt(payload.substring(0, 1), 16);
+                                  long docId = new BigInteger(payload.substring(1), 16).longValue();
+                                  int offset = markerStart - len;
+                                  if (len >= 1 && offset >= 0 && !overlaps(result, offset, len)) {
+                                      TLRPC.TL_messageEntityCustomEmoji ent = new TLRPC.TL_messageEntityCustomEmoji();
+                                      ent.offset = offset;
+                                      ent.length = len;
+                                      ent.document_id = docId;
+                                      if (!copied) {
+                                          result = result == null ? new ArrayList<TLRPC.MessageEntity>() : new ArrayList<TLRPC.MessageEntity>(result);
+                                          copied = true;
+                                      }
+                                      result.add(ent);
+                                  }
+                              } catch (Exception ignore) {
+                              }
+                              i = j;
+                              continue;
+                          }
+                      }
+                      i += cc;
+                  }
+                  return result;
+              }
+
+              private static boolean overlaps(ArrayList<TLRPC.MessageEntity> list, int offset, int length) {
+                  if (list == null) {
+                      return false;
+                  }
+                  for (TLRPC.MessageEntity e : list) {
+                      if (e instanceof TLRPC.TL_messageEntityCustomEmoji
+                              && e.offset < offset + length && offset < e.offset + e.length) {
+                          return true;
+                      }
+                  }
+                  return false;
+              }
+          }
+          JAVA_EOF
+          python3 - <<'PY_EOF'
+          import sys
+          J = "TMessagesProj/src/main/java/"
+          def edit(path, old, new):
+              s = open(path, encoding="utf-8").read()
+              if new in s:
+                  print("already patched:", path)
+                  return
+              if s.count(old) != 1:
+                  sys.exit("PATCH FAILED (found %d matches) in %s for: %s" % (s.count(old), path, old[:70]))
+              open(path, "w", encoding="utf-8").write(s.replace(old, new))
+              print("patched:", path)
+
+          # 1) use our own open-source history classes instead of the private submodule
+          edit(J + "org/telegram/ui/ChatActivity.java",
+               "import com.radolyn.ayugram.proprietary.AyuHistoryHook;",
+               "import com.radolyn.ayugram.history.AyuHistoryHook;")
+          edit(J + "com/radolyn/ayugram/ui/AyuMessageHistory.java",
+               "import com.radolyn.ayugram.proprietary.AyuMessageUtils;",
+               "import com.radolyn.ayugram.history.AyuMessageUtils;")
+          edit(J + "com/radolyn/ayugram/messages/AyuMessagesController.java",
+               "import com.radolyn.ayugram.proprietary.AyuMessageUtils;",
+               "import com.radolyn.ayugram.history.AyuMessageUtils;")
+
+          # 2) badge for chosen user IDs (see CustomBadge.java)
+          edit(J + "org/telegram/messenger/MessagesController.java",
+               "return !premiumLocked && (currentUser.premium || currentUser.id == getUserConfig().getClientUserId() && AyuConfig.localPremium);",
+               "if (currentUser != null && com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {\n            return true;\n        }\n        return !premiumLocked && (currentUser.premium || currentUser.id == getUserConfig().getClientUserId() && AyuConfig.localPremium);")
+          edit(J + "org/telegram/ui/Cells/ChatMessageCell.java",
+               "} else if (currentUser.premium) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();",
+               "} else if (currentUser.premium || com.radolyn.ayugram.CustomBadge.has(currentUser.id)) {\n                return ContextCompat.getDrawable(ApplicationLoader.applicationContext, R.drawable.msg_premium_liststar).mutate();")
+
+          # 3) visible name AyuGram -> JojoGram (text inside XML elements only, links are skipped)
+          import glob, re
+          pat = re.compile(r">([^<>]*AyuGram[^<>]*)<")
+          def fix(m):
+              t = m.group(1)
+              if "http" in t or "t.me" in t or "github" in t.lower():
+                  return m.group(0)
+              return ">" + t.replace("AyuGram", "JojoGram") + "<"
+          changed = 0
+          for p in glob.glob("TMessagesProj/src/main/res/values*/*.xml"):
+              s = open(p, encoding="utf-8").read()
+              n = pat.sub(fix, s)
+              if n != s:
+                  open(p, "w", encoding="utf-8").write(n)
+                  changed += 1
+          print("renamed visible strings in", changed, "files")
+          PY_EOF
+          python3 - <<'PY2_EOF'
+          import re
+          # JojoGram: show hidden premium-emoji markers (non-fatal: build continues if it cannot patch)
+          p = "TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java"
+          s = open(p, encoding="utf-8").read()
+          call = "entities = com.jojogram.premiumemoji.PremiumEmojiMarker.withHiddenEntities(spannable, entities);"
+          if call in s:
+              print("display hook already patched")
+          else:
+              m = re.search(r"replaceAnimatedEmoji\([^)]*boolean top\)\s*\{", s)
+              done = False
+              if m:
+                  pat = re.compile(r"([ \t]*)if \(entities == null\) \{\s*return spannable;\s*\}")
+                  m2 = pat.search(s, m.end())
+                  if m2:
+                      ins = m2.group(1) + call + "\n"
+                      s = s[:m2.start()] + ins + s[m2.start():]
+                      open(p, "w", encoding="utf-8").write(s)
+                      done = True
+              print("display hook patched" if done else "WARNING: display hook NOT patched")
+          PY2_EOF
+          python3 - <<'PY3_EOF'
+          import re
+          # JojoGram: put hidden markers after premium emoji when sending text (non-fatal)
+          p = "TMessagesProj/src/main/java/org/telegram/messenger/SendMessagesHelper.java"
+          s = open(p, encoding="utf-8").read()
+          if "PremiumEmojiMarker.addMarkers" in s:
+              print("send hook already patched")
+          else:
+              m = re.search(r"public void sendMessage\(SendMessageParams\s+(\w+)\)\s*\{", s)
+              if m:
+                  v = m.group(1)
+                  code = ("\n        try { if (%s != null && %s.message != null && %s.entities != null && !%s.entities.isEmpty()) { "
+                          "com.jojogram.premiumemoji.PremiumEmojiMarker.Result jojoR = com.jojogram.premiumemoji.PremiumEmojiMarker.addMarkers(%s.message, %s.entities); "
+                          "%s.message = jojoR.text; %s.entities = jojoR.entities; } } catch (Throwable jojoT) {}\n") % ((v,)*8)
+                  s = s[:m.end()] + code + s[m.end():]
+                  open(p, "w", encoding="utf-8").write(s)
+                  print("send hook patched")
+              else:
+                  print("WARNING: send hook NOT patched")
+          PY3_EOF
+          python3 - <<'PY4_EOF'
+          import re
+          # JojoGram: show premium emoji packs in the picker by treating the account as premium locally (non-fatal)
+          p = "TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java"
+          s = open(p, encoding="utf-8").read()
+          if "JOJO_FAKE_PREMIUM" in s:
+              print("premium unlock already patched")
+          else:
+              m = re.search(r"public boolean isPremium\(\)\s*\{", s)
+              if m:
+                  s = s[:m.end()] + "\n        if (true) { return true; } // JOJO_FAKE_PREMIUM" + s[m.end():]
+                  open(p, "w", encoding="utf-8").write(s)
+                  print("premium unlock patched")
+              else:
+                  print("WARNING: premium unlock NOT patched")
+          PY4_EOF
+          echo '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' | base64 -d > TMessagesProj/config/extera.jks
+          {
+            echo "APP_ID = ${TG_API_ID:-2040}"
+            echo "APP_HASH = \"${TG_API_HASH:-b18441a1ff607e10a989891a5462e627}\""
+            echo 'MAPS_V2_API = none'
+            echo 'SIGNING_KEY_STORE_PASSWORD = jojogram123'
+            echo 'SIGNING_KEY_ALIAS = jojo'
+            echo 'SIGNING_KEY_PASSWORD = jojogram123'
+          } > API_KEYS
+
+
+      - name: Debug - find send hook
+        run: |
+          F=$(find . -name SendMessagesHelper.java | head -n 1)
+          echo "FILE: $F"
+          grep -n "void sendMessage(SendMessageParams" "$F" || true
+          L=$(grep -n "void sendMessage(SendMessageParams" "$F" | head -n 1 | cut -d: -f1)
+          if [ -n "$L" ]; then sed -n "${L},$((L+45))p" "$F"; fi
+          echo "---- display hook check ----"
+          grep -n "PremiumEmojiMarker" TMessagesProj/src/main/java/org/telegram/messenger/MessageObject.java || echo "display hook NOT found"
+          echo "---- send hook check ----"
+          grep -n "PremiumEmojiMarker" "$F" || echo "send hook NOT found"
+          echo "---- premium unlock check ----"
+          grep -n "JOJO_FAKE_PREMIUM" TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java || echo "premium unlock NOT found"
+
+      - name: Extra diagnostics
+        run: |
+          J=TMessagesProj/src/main/java
+          echo "==== replaceAnimatedEmoji signature ===="
+          grep -n "replaceAnimatedEmoji(" $J/org/telegram/messenger/MessageObject.java | head -n 5 || true
+          echo "==== UserConfig.isPremium ===="
+          grep -n -A3 "boolean isPremium()" $J/org/telegram/messenger/UserConfig.java || true
+          echo "==== how emoji picker decides premium ===="
+          grep -n "isPremium()\|premiumFeaturesBlocked\|premiumLocked" $J/org/telegram/ui/Components/EmojiView.java | head -n 40 || true
+          echo "==== premium helpers in MessagesController ===="
+          grep -n "premiumFeaturesBlocked\|premiumLocked\|boolean isPremiumUser" $J/org/telegram/messenger/MessagesController.java | head -n 20 || true
+          echo "==== AyuConfig localPremium ===="
+          grep -rn "localPremium" $J/com/radolyn/ayugram | head -n 10 || true

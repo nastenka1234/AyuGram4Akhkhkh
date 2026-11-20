@@ -757,6 +757,35 @@ jobs:
               else:
                   print("WARNING: premium unlock NOT patched")
           PY4_EOF
+          python3 - <<'PY5_EOF'
+          import re
+          # JojoGram: re-enable the featured (trending) emoji packs list that this fork disabled (non-fatal)
+          p = "TMessagesProj/src/main/java/org/telegram/ui/Components/EmojiView.java"
+          s = open(p, encoding="utf-8").read()
+          lines = s.split("\n")
+          clears = [i for i, l in enumerate(lines) if "featuredEmojiSets.clear();" in l and not l.strip().startswith("//")]
+          if len(clears) != 1:
+              print("WARNING: featured emoji NOT patched (clear lines: %d)" % len(clears))
+          else:
+              c = clears[0]
+              add = None
+              for i in range(c + 1, min(c + 20, len(lines))):
+                  if re.match(r"^\s*//+\s*featuredEmojiSets\.add\(set\);\s*$", lines[i]):
+                      add = i
+                      break
+              if add is None:
+                  print("WARNING: featured emoji NOT patched (commented add not found)")
+              else:
+                  live = [l for l in lines[c + 1:add] if l.strip() and not l.strip().startswith("//")]
+                  has_for = any(re.search(r"\bfor\s*\(", l) for l in live)
+                  has_set = any(re.search(r"StickerSetCovered\s+set\s*=", l) for l in live)
+                  if has_for and has_set:
+                      lines[add] = re.sub(r"^(\s*)//+\s*", r"\1", lines[add])
+                      open(p, "w", encoding="utf-8").write("\n".join(lines))
+                      print("featured emoji patched")
+                  else:
+                      print("WARNING: featured emoji NOT patched (loop shape differs)")
+          PY5_EOF
           echo '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' | base64 -d > TMessagesProj/config/extera.jks
           {
             echo "APP_ID = ${TG_API_ID:-2040}"
@@ -783,15 +812,7 @@ jobs:
           grep -n "JOJO_FAKE_PREMIUM" TMessagesProj/src/main/java/org/telegram/messenger/UserConfig.java || echo "premium unlock NOT found"
       - name: Debug - emoji panel
         run: |
-          J=TMessagesProj/src/main/java/org/telegram
-          echo "==== MediaDataController 7485-7510 ===="
-          sed -n 7485,7510p $J/messenger/MediaDataController.java | cut -c1-200
-          echo "==== featured emoji in MediaDataController ===="
-          grep -n "getFeaturedEmojiSets\|loadFeaturedEmoji\|FEATURED_EMOJI\|featuredEmojiSets" $J/messenger/MediaDataController.java | cut -c1-180 | head -n 20 || true
-          echo "==== featuredEmojiSets in EmojiView ===="
-          grep -n "featuredEmojiSets" $J/ui/Components/EmojiView.java | cut -c1-200 | head -n 20 || true
-          echo "==== setAllowStickersAndGifs callers ===="
-          grep -rn "setAllowStickersAndGifs(" $J/ui/ChatActivity.java | cut -c1-220 | head -n 10 || true
+          grep -n -B6 -A6 "featuredEmojiSets.clear();" TMessagesProj/src/main/java/org/telegram/ui/Components/EmojiView.java | cut -c1-200
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -815,11 +836,11 @@ jobs:
       - name: Collect APK
         run: |
           mkdir -p jojo-out
-          find . -path "*/build/outputs/*" -name "*.apk" -not -path "./jojo-out/*" -exec cp -v {} jojo-out/ \;
+          find . -name "*.apk" -size +5M -not -path "./jojo-out/*" -not -path "*/src/*" -print -exec cp -v {} jojo-out/ \;
           ls -la jojo-out
           if [ -z "$(ls -A jojo-out)" ]; then
-            echo "NO APK FOUND. Listing build outputs:"
-            find . -path "*/build/outputs/*" | head -n 50
+            echo "NO APK FOUND. apk/aab/redirect files anywhere:"
+            find . \( -name "*.apk" -o -name "*.aab" -o -name "redirect.txt" -o -name "output-metadata.json" \) -not -path "*/src/*" | head -n 40
             exit 1
           fi
 
